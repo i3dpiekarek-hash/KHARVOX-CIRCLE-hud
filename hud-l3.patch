@@ -1,0 +1,180 @@
+diff --git a/src/circlevr/src/vkcore/CMakeLists.txt b/src/circlevr/src/vkcore/CMakeLists.txt
+index 965d65b..241a436 100644
+--- a/src/circlevr/src/vkcore/CMakeLists.txt
++++ b/src/circlevr/src/vkcore/CMakeLists.txt
+@@ -76,6 +76,7 @@ add_library(circle_vr_layer SHARED
+     gpu_timing.cpp
+     gpu_timing_report.cpp
+     head_sweep.cpp
++    hud_toggle.cpp
+     import_patch.cpp
+     keep_active.cpp
+     key_inject.cpp
+diff --git a/src/circlevr/src/vkcore/hud_toggle.cpp b/src/circlevr/src/vkcore/hud_toggle.cpp
+new file mode 100644
+index 0000000..bcfd10b
+--- /dev/null
++++ b/src/circlevr/src/vkcore/hud_toggle.cpp
+@@ -0,0 +1,78 @@
++#include "vkcore/hud_toggle.hpp"
++
++#include "vkcore/cvar_book.hpp"
++#include "vkcore/game_text.hpp"
++#include "vkcore/log.hpp"
++#include "vkcore/mp_guard.hpp"
++#include "vkcore/taa_locate.hpp"
++
++#include <cstddef>
++#include <mutex>
++#include <string_view>
++#include <vector>
++
++namespace circlevr::vkcore {
++
++namespace {
++
++constexpr const char* kTag = "hud-toggle";
++
++std::mutex g_mutex;
++bool g_located = false;          // the lookup ran (once; a miss is not retried every press)
++std::byte* g_cvar = nullptr;     // g_showHud's cvar object
++std::string_view g_name;         // the spelling the game registered it under
++cvar_book::SetStringFn g_setter = nullptr;
++
++// Under g_mutex. The game's console is case-insensitive; the registration string has one fixed spelling, so
++// both are tried and the one registered exactly once is kept.
++void locate() {
++    g_located = true;
++    GameImage image;
++    if (!locateGameImage(image, kTag)) {
++        CIRCLE_VR_LOG("%s: the game module cannot be read; the HUD stays as the game has it", kTag);
++        return;
++    }
++    g_setter = reinterpret_cast<cvar_book::SetStringFn>(const_cast<std::byte*>(findCvarSetter(image)));
++    const std::vector<std::string_view> names{"g_showHud", "g_showhud"};
++    const std::vector<std::byte*> objects = findCvarObjects(image, names);
++    for (std::size_t i = 0; i < objects.size(); ++i) {
++        if (objects[i]) {
++            g_cvar = objects[i];
++            g_name = names[i];
++            break;
++        }
++    }
++    if (!g_cvar || !g_setter) {
++        CIRCLE_VR_LOG("%s: %s; the HUD toggle does nothing in this build", kTag,
++                !g_setter ? "cvar SetString not found" : "g_showHud not registered exactly once");
++        g_cvar = nullptr;
++        return;
++    }
++    CIRCLE_VR_LOG("%s: %.*s found; L3 with the left stick at rest hides or shows the HUD (now %d)", kTag,
++            static_cast<int>(g_name.size()), g_name.data(), cvarInt(g_cvar));
++}
++
++} // namespace
++
++void toggleHud() {
++    if (!mp_guard::allowsGameTouch()) {
++        return;
++    }
++    std::lock_guard lock(g_mutex);
++    if (!g_located) {
++        locate();
++    }
++    if (!g_cvar || !g_setter) {
++        return;
++    }
++    const int before = cvarInt(g_cvar);
++    const char* next = before != 0 ? "0" : "1";
++    if (cvar_book::write(g_name, g_cvar, g_setter, next)) {
++        CIRCLE_VR_LOG("%s: HUD %s (%.*s %d -> %s, reads %d)", kTag, before != 0 ? "hidden" : "shown",
++                static_cast<int>(g_name.size()), g_name.data(), before, next, cvarInt(g_cvar));
++    } else {
++        CIRCLE_VR_LOG("%s: the write was refused (guard or cvar book); the HUD is unchanged", kTag);
++    }
++}
++
++} // namespace circlevr::vkcore
+diff --git a/src/circlevr/src/vkcore/hud_toggle.hpp b/src/circlevr/src/vkcore/hud_toggle.hpp
+new file mode 100644
+index 0000000..5e9fe1a
+--- /dev/null
++++ b/src/circlevr/src/vkcore/hud_toggle.hpp
+@@ -0,0 +1,18 @@
++#pragma once
++
++// HUD on/off for the player (L3 tap with the left stick at rest, motor/default_input.hpp).
++//
++// The game's own cvar g_showHud hides the whole gameplay HUD (health, stamina, tool uses, prompts) when it
++// is 0. The retail console refuses it, but the layer writes cvars through the engine's setter
++// (idCVar::SetString) as taa_hooks.cpp and climb_hook.cpp do: the cvar object is found by its registration,
++// the write goes through the cvar book, so a multiplayer guard trip gives the game's own value back.
++//
++// Anything missing (cvar not found once, setter not found, guard not armed) leaves the game untouched and is
++// logged once.
++
++namespace circlevr::vkcore {
++
++// Flips g_showHud between 0 and 1. Cheap; call from the input thread when the player asks for it.
++void toggleHud();
++
++} // namespace circlevr::vkcore
+diff --git a/src/motor/default_input.hpp b/src/motor/default_input.hpp
+index a26d44b..59d96e3 100644
+--- a/src/motor/default_input.hpp
++++ b/src/motor/default_input.hpp
+@@ -114,7 +114,7 @@ inline Pad merge(Pad real,Pad vr){
+  if(std::hypot(real.rx,real.ry)<.15f){real.rx=vr.rx;real.ry=vr.ry;}
+  real.lt=std::max(real.lt,vr.lt);real.rt=std::max(real.rt,vr.rt);return real;
+ }
+-struct Result {Pad pad{};float viewTurn{};Context context{Context::Unknown};bool modifier{},motion{},gestures{},pause{},aim{},holster{},push{},reload{},firearmMelee{};unsigned physicalAttacks{};std::array<float,2> fingerGesture{};CarryAction carryAction{};int journalZoom{};uint64_t throwToken{};bool blow{},waterMotion{};};
++struct Result {Pad pad{};float viewTurn{};Context context{Context::Unknown};bool modifier{},motion{},gestures{},pause{},aim{},holster{},push{},reload{},firearmMelee{};unsigned physicalAttacks{};std::array<float,2> fingerGesture{};CarryAction carryAction{};int journalZoom{};uint64_t throwToken{};bool blow{},waterMotion{};bool hudToggle{};};
+ inline bool nativeWaterMotion(const Native& n,const Result& r){
+  return r.motion&&n.fresh&&!n.menu&&n.projection&&!n.animated&&!n.local&&!n.reason&&n.type==0&&
+   (n.mode==7||n.mode==8||n.mode==20);
+@@ -138,6 +138,7 @@ inline uint64_t combatActions(const Result& r){
+ class Profile {
+  uint64_t session{},yAt{},tapUntil{},pauseUntil{},leftAt{},rightAt{},sprintUntil{};
+  bool compatible{},initialized{},hadFocus{},wasY{},usedY{},pauseLatched{},oldLeft{},oldRight{};
++ bool hudCandidate{}; // L3 pressed with the left stick at rest: its release toggles the HUD
+  unsigned oldFamily{};
+  std::array<uint16_t,2> blocked{};
+  std::array<bool,2> gestureBlocked{};
+@@ -324,7 +325,17 @@ private:
+    pushCandidate=ctx==Context::Unarmed&&!y&&!input.rightWhip&&l.tracked&&r.tracked&&l.grip>=.9f&&r.grip>=.9f;}
+   if(!y&&l.click&&r.click&&!pauseLatched&&leftAt&&rightAt&&
+      (leftAt>rightAt?leftAt-rightAt:rightAt-leftAt)<=pauseWindow){pauseLatched=true;pauseUntil=now+90;sprintUntil=0;}
+-  if(!l.click&&oldLeft&&!y&&!pauseLatched&&now-leftAt<=pauseWindow)sprintUntil=now+90;
++  // L3 click with the left stick at rest hides/shows the HUD when it is released. Sprint needs the stick
++  // pushed, so a pushed stick (or any chord: R3 pause, Y modifier) keeps its meaning. The sprint button
++  // itself is sent exactly as before; only the short sprint pulse after a quiet tap is dropped.
++  const float leftStickMag=std::hypot(l.x,l.y);
++  if(l.click&&!oldLeft)hudCandidate=leftStickMag<.2f&&!y&&!r.click;
++  if(l.click&&(leftStickMag>.35f||r.click||y||pauseLatched))hudCandidate=false;
++  if(!l.click&&oldLeft){
++   if(hudCandidate&&gameplay(ctx)&&!y&&!pauseLatched&&leftStickMag<.35f&&now-leftAt<=800)out.hudToggle=true;
++   hudCandidate=false;
++  }
++  if(!l.click&&oldLeft&&!y&&!pauseLatched&&!out.hudToggle&&now-leftAt<=pauseWindow)sprintUntil=now+90;
+   const bool rightReleased=!r.click&&oldRight;
+   oldLeft=l.click;oldRight=r.click;
+   if(l.menu||now<pauseUntil){carry.cancel();itemStrikeAt=0;itemStrikeEdge=false;itemStrikeMask=0;holsterUntil=pushUntil=0;pushCandidate=false;pushSent=true;holsterSent=true;interactHeld={};interactArmed={};p={};p.buttons=Start;out.pause=true;return out;}
+diff --git a/src/motor/locomotion_runtime.cpp b/src/motor/locomotion_runtime.cpp
+index df2dfb1..b5f0dfe 100644
+--- a/src/motor/locomotion_runtime.cpp
++++ b/src/motor/locomotion_runtime.cpp
+@@ -16,6 +16,7 @@
+ #include "interaction_runtime.hpp"
+ #include "motor/sequential.hpp"
+ #include "vkcore/log.hpp"
++#include "vkcore/hud_toggle.hpp"
+ #include <windows.h>
+ #include <Xinput.h>
+ #include <mutex>
+@@ -101,6 +102,7 @@ input::Result resolveInput(bool foreground){
+  physical.supportGrip=hands::supportGripInput(snapshot,n.entity,input::firearmContext(ctx)&&fresh&&sequential::projectionAllowed()&&!sequential::menuActive());
+  const auto interactionAxis=hands::interactionStick(snapshot,n);
+  auto out=defaultProfile.update(physical,ctx,now,hands::punchTriggers(snapshot,n),interactionAxis[0],pauseWindow,interactionAxis[1]);
++ if(out.hudToggle)circlevr::vkcore::toggleHud(); // L3 tap, left stick at rest: HUD on/off
+  // Mounted aiming is consumed only by the native gun joint calculation.
+  // Do not synthesize right-stick motion: that also turns the native camera.
+  turret::manualInput(std::hypot(physical.hand[1].x,physical.hand[1].y)>=.15f||
