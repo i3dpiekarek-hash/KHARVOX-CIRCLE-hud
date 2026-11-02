@@ -9,6 +9,9 @@ jobs:
       - name: Apply the L3 HUD patch
         shell: bash
         run: git apply --ignore-whitespace --whitespace=nowarn hud-l3.patch
+      - name: Refresh the build profile checksum
+        shell: bash
+        run: python tools/generate-build-profiles.py
       - name: Configure
         run: cmake --preset windows-x64
       - name: Build the layer DLL
