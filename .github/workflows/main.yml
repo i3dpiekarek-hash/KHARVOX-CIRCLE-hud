@@ -1,0 +1,24 @@
+name: Build KharvoxCircle.dll
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply the L3 HUD patch
+        shell: bash
+        run: git apply --ignore-whitespace --whitespace=nowarn hud-l3.patch
+      - name: Configure
+        run: cmake --preset windows-x64
+      - name: Build the layer DLL
+        run: cmake --build --preset windows-x64 --target circle_vr_layer
+      - name: Check the DLL exists
+        shell: pwsh
+        run: |
+          if (!(Test-Path bin/KharvoxCircle.dll)) { throw "bin/KharvoxCircle.dll not found" }
+          Get-Item bin/KharvoxCircle.dll | Select-Object Name, Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KharvoxCircle-dll
+          path: bin/KharvoxCircle.dll
