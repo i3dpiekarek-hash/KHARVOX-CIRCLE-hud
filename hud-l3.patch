@@ -1,0 +1,210 @@
+diff --git a/src/circlevr/src/vkcore/CMakeLists.txt b/src/circlevr/src/vkcore/CMakeLists.txt
+index 965d65b..241a436 100644
+--- a/src/circlevr/src/vkcore/CMakeLists.txt
++++ b/src/circlevr/src/vkcore/CMakeLists.txt
+@@ -76,6 +76,7 @@ add_library(circle_vr_layer SHARED
+     gpu_timing.cpp
+     gpu_timing_report.cpp
+     head_sweep.cpp
++    hud_toggle.cpp
+     import_patch.cpp
+     keep_active.cpp
+     key_inject.cpp
+diff --git a/src/circlevr/src/vkcore/hud_toggle.cpp b/src/circlevr/src/vkcore/hud_toggle.cpp
+new file mode 100644
+index 0000000..a266348
+--- /dev/null
++++ b/src/circlevr/src/vkcore/hud_toggle.cpp
+@@ -0,0 +1,22 @@
++#include "vkcore/hud_toggle.hpp"
++
++#include "vkcore/log.hpp"
++
++#include <atomic>
++
++namespace circlevr::vkcore {
++
++namespace {
++std::atomic<unsigned> g_hidden{0};
++} // namespace
++
++void toggleHud() {
++    const bool nowHidden = (g_hidden.fetch_xor(1u, std::memory_order_acq_rel) & 1u) == 0u;
++    CIRCLE_VR_LOG("hud-toggle: HUD %s", nowHidden ? "hidden" : "shown");
++}
++
++bool hudHidden() {
++    return (g_hidden.load(std::memory_order_relaxed) & 1u) != 0u;
++}
++
++} // namespace circlevr::vkcore
+diff --git a/src/circlevr/src/vkcore/hud_toggle.hpp b/src/circlevr/src/vkcore/hud_toggle.hpp
+new file mode 100644
+index 0000000..57aa342
+--- /dev/null
++++ b/src/circlevr/src/vkcore/hud_toggle.hpp
+@@ -0,0 +1,20 @@
++#pragma once
++
++// HUD on/off for the player (L3 tap with the left stick at rest: motor/default_input.hpp for the VR
++// controller profile, motor/locomotion_runtime.cpp for a physical gamepad).
++//
++// The gameplay HUD is the GUI quad the layer shows in front of the player (presenter_frame.cpp, the head-yaw
++// anchored panel: health, stamina, tool uses, prompts). While the HUD is hidden that one quad is left out of
++// the frame. Nothing is written into the game: no cvar, no memory, so it works on every build and needs no
++// multiplayer-guard approval. Menus, loading screens, cutscenes, the photo and binocular viewfinders and the
++// hand-aim dot are not affected.
++
++namespace circlevr::vkcore {
++
++// Flips the HUD between hidden and shown. Any thread.
++void toggleHud();
++
++// True while the player has hidden the HUD. Lock-free, any thread.
++bool hudHidden();
++
++} // namespace circlevr::vkcore
+diff --git a/src/circlevr/src/vkcore/presenter_frame.cpp b/src/circlevr/src/vkcore/presenter_frame.cpp
+index c977b20..8016744 100644
+--- a/src/circlevr/src/vkcore/presenter_frame.cpp
++++ b/src/circlevr/src/vkcore/presenter_frame.cpp
+@@ -21,6 +21,7 @@
+ #include "vkcore/frame_pacing.hpp"
+ #include "vkcore/gpu_timing.hpp"
+ #include "vkcore/head_sweep.hpp"
++#include "vkcore/hud_toggle.hpp"
+ #include "vkcore/keep_active.hpp"
+ #include "vkcore/key_inject.hpp"
+ #include "vkcore/light_cull.hpp"
+@@ -610,6 +611,7 @@ void XrPresenter::Impl::frame() {
+             if (uiShown) {
+                 const auto anchor=circle::motor::hudAnchor(livePairShown,
+                     circle::motor::sequential::menuActive(),quad.space!=XR_NULL_HANDLE);
++                bool hideHudQuad = false; // the player hid the gameplay HUD (L3): the panel is left out of the frame
+                 if (anchor==circle::motor::HudAnchor::CinemaImage) {
+                     // The same UI image for BOTH eyes, exactly on the cinema plane.
+                     uiQuad.space = quad.space; uiQuad.pose = quad.pose; uiQuad.size = quad.size;
+@@ -654,7 +656,10 @@ void XrPresenter::Impl::frame() {
+                         panel.orientation = head->orientation;
+                         panel.position = head->position + forward * settings.ui.distanceMetres;
+                         circleHudYawTime = 0.0;
+-                    } else panel.position.y += settings.ui.offsetYMetres;
++                    } else {
++                        panel.position.y += settings.ui.offsetYMetres;
++                        hideHudQuad = hudHidden();
++                    }
+                     uiQuad.space = localSpace;
+                     uiQuad.pose = {{panel.orientation.x, panel.orientation.y, panel.orientation.z, panel.orientation.w},
+                                    {panel.position.x, panel.position.y, panel.position.z}};
+@@ -662,7 +667,7 @@ void XrPresenter::Impl::frame() {
+                     // Do not fall back to a tilted head-locked layer on tracking loss.
+                     uiShown = false;
+                 }
+-                if (uiShown) layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&uiQuad);
++                if (uiShown && !hideHudQuad) layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&uiQuad);
+             }
+         }
+         // A menu's 3D model goes where the panel shows the menu (menu_model_hook.hpp).
+diff --git a/src/motor/default_input.hpp b/src/motor/default_input.hpp
+index a26d44b..ca3e498 100644
+--- a/src/motor/default_input.hpp
++++ b/src/motor/default_input.hpp
+@@ -114,7 +114,7 @@ inline Pad merge(Pad real,Pad vr){
+  if(std::hypot(real.rx,real.ry)<.15f){real.rx=vr.rx;real.ry=vr.ry;}
+  real.lt=std::max(real.lt,vr.lt);real.rt=std::max(real.rt,vr.rt);return real;
+ }
+-struct Result {Pad pad{};float viewTurn{};Context context{Context::Unknown};bool modifier{},motion{},gestures{},pause{},aim{},holster{},push{},reload{},firearmMelee{};unsigned physicalAttacks{};std::array<float,2> fingerGesture{};CarryAction carryAction{};int journalZoom{};uint64_t throwToken{};bool blow{},waterMotion{};};
++struct Result {Pad pad{};float viewTurn{};Context context{Context::Unknown};bool modifier{},motion{},gestures{},pause{},aim{},holster{},push{},reload{},firearmMelee{};unsigned physicalAttacks{};std::array<float,2> fingerGesture{};CarryAction carryAction{};int journalZoom{};uint64_t throwToken{};bool blow{},waterMotion{};bool hudToggle{};};
+ inline bool nativeWaterMotion(const Native& n,const Result& r){
+  return r.motion&&n.fresh&&!n.menu&&n.projection&&!n.animated&&!n.local&&!n.reason&&n.type==0&&
+   (n.mode==7||n.mode==8||n.mode==20);
+@@ -138,6 +138,7 @@ inline uint64_t combatActions(const Result& r){
+ class Profile {
+  uint64_t session{},yAt{},tapUntil{},pauseUntil{},leftAt{},rightAt{},sprintUntil{};
+  bool compatible{},initialized{},hadFocus{},wasY{},usedY{},pauseLatched{},oldLeft{},oldRight{};
++ bool hudCandidate{}; // L3 pressed with the left stick at rest: its release toggles the HUD
+  unsigned oldFamily{};
+  std::array<uint16_t,2> blocked{};
+  std::array<bool,2> gestureBlocked{};
+@@ -324,7 +325,17 @@ private:
+    pushCandidate=ctx==Context::Unarmed&&!y&&!input.rightWhip&&l.tracked&&r.tracked&&l.grip>=.9f&&r.grip>=.9f;}
+   if(!y&&l.click&&r.click&&!pauseLatched&&leftAt&&rightAt&&
+      (leftAt>rightAt?leftAt-rightAt:rightAt-leftAt)<=pauseWindow){pauseLatched=true;pauseUntil=now+90;sprintUntil=0;}
+-  if(!l.click&&oldLeft&&!y&&!pauseLatched&&now-leftAt<=pauseWindow)sprintUntil=now+90;
++  // L3 click with the left stick at rest hides/shows the HUD when it is released. Sprint needs the stick
++  // pushed, so a pushed stick (or any chord: R3 pause, Y modifier) keeps its meaning. The sprint button
++  // itself is sent exactly as before; only the short sprint pulse after a quiet tap is dropped.
++  const float leftStickMag=std::hypot(l.x,l.y);
++  if(l.click&&!oldLeft)hudCandidate=leftStickMag<.5f&&!y&&!r.click;
++  if(l.click&&(leftStickMag>.7f||r.click||y||pauseLatched))hudCandidate=false;
++  if(!l.click&&oldLeft){
++   if(hudCandidate&&gameplay(ctx)&&!y&&!pauseLatched&&leftStickMag<.7f&&now-leftAt<=800)out.hudToggle=true;
++   hudCandidate=false;
++  }
++  if(!l.click&&oldLeft&&!y&&!pauseLatched&&!out.hudToggle&&now-leftAt<=pauseWindow)sprintUntil=now+90;
+   const bool rightReleased=!r.click&&oldRight;
+   oldLeft=l.click;oldRight=r.click;
+   if(l.menu||now<pauseUntil){carry.cancel();itemStrikeAt=0;itemStrikeEdge=false;itemStrikeMask=0;holsterUntil=pushUntil=0;pushCandidate=false;pushSent=true;holsterSent=true;interactHeld={};interactArmed={};p={};p.buttons=Start;out.pause=true;return out;}
+diff --git a/src/motor/locomotion_runtime.cpp b/src/motor/locomotion_runtime.cpp
+index df2dfb1..ccfbe36 100644
+--- a/src/motor/locomotion_runtime.cpp
++++ b/src/motor/locomotion_runtime.cpp
+@@ -16,6 +16,8 @@
+ #include "interaction_runtime.hpp"
+ #include "motor/sequential.hpp"
+ #include "vkcore/log.hpp"
++#include "vkcore/hud_toggle.hpp"
++#include "pad_hud_toggle.hpp"
+ #include <windows.h>
+ #include <Xinput.h>
+ #include <mutex>
+@@ -101,6 +103,7 @@ input::Result resolveInput(bool foreground){
+  physical.supportGrip=hands::supportGripInput(snapshot,n.entity,input::firearmContext(ctx)&&fresh&&sequential::projectionAllowed()&&!sequential::menuActive());
+  const auto interactionAxis=hands::interactionStick(snapshot,n);
+  auto out=defaultProfile.update(physical,ctx,now,hands::punchTriggers(snapshot,n),interactionAxis[0],pauseWindow,interactionAxis[1]);
++ if(out.hudToggle)circlevr::vkcore::toggleHud(); // L3 tap, left stick at rest: HUD on/off
+  // Mounted aiming is consumed only by the native gun joint calculation.
+  // Do not synthesize right-stick motion: that also turns the native camera.
+  turret::manualInput(std::hypot(physical.hand[1].x,physical.hand[1].y)>=.15f||
+@@ -185,6 +188,13 @@ void publishPad(XINPUT_STATE* output,const XINPUT_GAMEPAD& pad,DWORD result){
+ DWORD WINAPI getState(DWORD user,XINPUT_STATE* output){
+  auto fn=original.load();auto result=fn?fn(user,output):DWORD(ERROR_DEVICE_NOT_CONNECTED);
+  if(user||!output)return result;
++ { // Physical pad: L3 tap with the stick not pushed hides/shows the HUD, with or without the VR controller profile.
++  static std::mutex hudMutex;static input::PadHudToggle hudPad;bool fire=false;
++  if(result==ERROR_SUCCESS){const auto& g=output->Gamepad;std::lock_guard hudLock(hudMutex);
++   static bool announced=false;if(!announced){announced=true;circlevr::vkcore::logf("hud-toggle: ready, a physical pad L3 tap with the left stick not pushed hides or shows the HUD");}
++   fire=hudPad.update((g.wButtons&XINPUT_GAMEPAD_LEFT_THUMB)!=0,(g.wButtons&XINPUT_GAMEPAD_RIGHT_THUMB)!=0,g.sThumbLX/32767.f,g.sThumbLY/32767.f,GetTickCount64());}
++  if(fire)circlevr::vkcore::toggleHud();
++ }
+  std::lock_guard lock(mutex);realPad=result==ERROR_SUCCESS?output->Gamepad:XINPUT_GAMEPAD{};
+  if(!inputEnabled())return result;
+  DWORD foreground=0;GetWindowThreadProcessId(GetForegroundWindow(),&foreground);
+diff --git a/src/motor/pad_hud_toggle.hpp b/src/motor/pad_hud_toggle.hpp
+new file mode 100644
+index 0000000..82e4d21
+--- /dev/null
++++ b/src/motor/pad_hud_toggle.hpp
+@@ -0,0 +1,22 @@
++#pragma once
++#include <cmath>
++#include <cstdint>
++
++namespace circle::motor::input {
++// A physical gamepad's L3 click released within 800 ms, with the left stick not pushed (a click often tilts
++// it a little), asks for the HUD toggle once, on release. With the stick pushed, L3 stays sprint: nothing is
++// sent or removed here, the pad reaches the game as it always did.
++class PadHudToggle {
++ bool held{},candidate{};uint64_t at{};
++public:
++ bool update(bool leftClick,bool rightClick,float stickX,float stickY,uint64_t now){
++  const float mag=std::hypot(stickX,stickY);
++  bool fire=false;
++  if(leftClick&&!held){candidate=mag<.5f&&!rightClick;at=now;}
++  if(leftClick&&(mag>.7f||rightClick))candidate=false;
++  if(!leftClick&&held){fire=candidate&&mag<.7f&&now-at<=800;candidate=false;}
++  held=leftClick;
++  return fire;
++ }
++};
++}
